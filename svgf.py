@@ -1,5 +1,5 @@
 from utils import *
-import logging
+from tqdm import tqdm
 import numpy as np
 import torch
 from torch import linalg
@@ -174,7 +174,7 @@ def estimate_variance(curr, accum):
 
     y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
     x = torch.linspace(0, hori_res - 1, steps=hori_res, dtype=torch.long)
-    y, x = torch.meshgrid(y, x)
+    y, x = torch.meshgrid(y, x, indexing='ij')
     y = y.unsqueeze(-1)
     x = x.unsqueeze(-1)
 
@@ -239,7 +239,7 @@ def masked_indices(mask):
     vert_res, hori_res = mask.shape[0:2]
     y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
     x = torch.linspace(0, hori_res - 1, steps=hori_res, dtype=torch.long)
-    y, x = torch.meshgrid(y, x)
+    y, x = torch.meshgrid(y, x, indexing='ij')
     grid = torch.stack((x, y), dim=2)
 
     return grid[mask]
@@ -253,7 +253,7 @@ def gaussian_prefilter_variance(variance):
 
     y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
     x = torch.linspace(0, hori_res - 1, steps=hori_res, dtype=torch.long)
-    y, x = torch.meshgrid(y, x)
+    y, x = torch.meshgrid(y, x, indexing='ij')
     y = y.unsqueeze(-1)
     x = x.unsqueeze(-1)
     
@@ -291,7 +291,7 @@ def atrous_filter(curr, accum_color, variance, level):
     sum_w = torch.zeros_like(curr['color'])
     y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
     x = torch.linspace(0, hori_res - 1, steps=hori_res, dtype=torch.long)
-    y, x = torch.meshgrid(y, x)
+    y, x = torch.meshgrid(y, x, indexing='ij')
     y = y.unsqueeze(-1)
     x = x.unsqueeze(-1)
 
@@ -317,7 +317,7 @@ def atrous_filter(curr, accum_color, variance, level):
             w_depth = torch.exp(-depth_diff / sigma_depth)
 
             cos_normals = torch.sum(curr['normal'][center_y, center_x] * curr['normal'][p_y, p_x], dim=-1)
-            w_normal = torch.clamp(cos_normals, min=0.0001) ** sigma_normal
+            w_normal = torch.clamp(cos_normals, min=0) ** sigma_normal
             #[Dammertz2010] style weight formulation
             #w_normal = torch.exp(-cos_normals / sigma_normal**2)
             w_normal = w_normal.unsqueeze(-1)
@@ -331,7 +331,7 @@ def atrous_filter(curr, accum_color, variance, level):
             #luminance_diff = (accum_color[center_y, center_x] - accum_color[p_y, p_x])
             #w_luminance = torch.exp(-linalg.norm(luminance_diff, dim=-1) / sigma_luminance**2).unsqueeze(-1)
             
-            weight = w_luminance # * w_depth * w_normal
+            weight = w_luminance * w_normal #* w_depth# * w_normal
             kernel_w = kernel_w.expand(weight.shape)
             w = weight * kernel_w
 
@@ -349,17 +349,19 @@ def atrous_filter(curr, accum_color, variance, level):
 
 frames = []
 camera_infos = []
-frame_step = 1
-for i in range(0, 151, frame_step):
+frame_step = 20
+for i in tqdm(range(0, 151, frame_step)):
     frame, camera_info = load_frame(i)
     frames.append(frame)
     camera_infos.append(camera_info)
+
+print('{} frames loaded.'.format(len(range(0, 151, frame_step))))
 
 vert_res, hori_res = frames[0]['color'].shape[0:2]
 
 accum = {}
 
-for i in range(1, len(frames)):
+for i in tqdm(range(1, len(frames))):
     curr = frames[i]
     prev = frames[i - 1]
     curr_camera_info = camera_infos[i]

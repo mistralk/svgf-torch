@@ -75,6 +75,6 @@ def load_frame(frame_i):
     camera_info['view'] = torch.from_numpy(camera_info['view']).float().to(device)
     camera_info['proj'] = torch.from_numpy(camera_info['proj']).float().to(device)
 
-    logging.info('Frame #{} loaded'.format(frame_i))
+    # logging.info('Frame #{} loaded'.format(frame_i))
 
     return frame, camera_info
