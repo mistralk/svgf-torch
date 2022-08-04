@@ -4,6 +4,9 @@ import numpy as np
 import torch
 from torch import linalg
 
+sigma_depth = 4
+sigma_normal = 128
+sigma_luminance = 4
 
 def backproject(curr, prev_camera_info):
     """
@@ -144,87 +147,88 @@ def temporal_accumulate(curr, prev, reproj_coord):
 
     # TODO: additional 3x3 filtering for inconsistent pixels
 
-    """
-    TODO: temporal variance estimation
-    - estimate per-pixel luminance variance using mu1, mu2 (the first and second raw moments)
-    - temporally accumulate these moments, reusing the geometric tests
-    - estimate temporal variance from integrated moments using the simple formular var = mu2 - mu1^2
-    - < 4 frames after disocclusion, instead estimate the variance spatially, using a 7x7 bilater filter
-
-    history length를 보존해야 한다. (++history_length)
-    per-pixel luminance moments를 매 프레임 누적해나간다. (moment integration)
-    만약 history length가 4 이상이면 integrated moments를 이용해서 배리언스를 계산한다.
-    history length가 4 미만이면 대신 spatial variance를 계산한 후 bilateral 필터링한다.
-
-    bilateral filter에서 퍼픽셀 웨이트 계산하기
-    float computeWeight(
-        float depthCenter, float depthP, float phiDepth,
-        float3 normalCenter, float3 normalP, float phiNormal,
-        float luminanceIllumCenter, float luminanceIllumP, float phiIllum)
-    {
-        const float weightNormal  = pow(saturate(dot(normalCenter, normalP)), phiNormal);
-        const float weightZ       = (phiDepth == 0) ? 0.0f : abs(depthCenter - depthP) / phiDepth;
-        const float weightLillum  = abs(luminanceIllumCenter - luminanceIllumP) / phiIllum;
-
-        const float weightIllum   = exp(0.0 - max(weightLillum, 0.0) - max(weightZ, 0.0)) * weightNormal;
-
-        return weightIllum;
-    }
-
-    
-    """
-
     # per-pixel moment calculation and temporal integration
     moment1 = color
     moment2 = moment1 * moment1
     moment1 = lerp(moment1, prev['moment1'], 0.2)
     moment2 = lerp(moment2, prev['moment2'], 0.2)
-
-    # temporal variance
-    # variance = moment2 - moment1 * moment1
-
+    
     accum = {}
     accum['color'] = color
     accum['moment1'] = moment1
     accum['moment2'] = moment2
+    
     accum['history_len'] = prev['history_len']
     accum['world_pos'] = prev['world_pos']
     accum['normal'] = prev['normal']
 
     return accum, any_valid
 
-    """
-    # [H, W, Surrounding corner, Channel] = [1000, 900, 4, 4]
-    
-    # valid한 좌표만을 인덱싱할 수 있을까?
-
-    #valid = torch.ones(valid.shape, dtype=torch.bool)
-
-    tap_contrib = prev[corner_y * valid, corner_x * valid] * bilinear_w
-    sum_tap = torch.sum(tap_contrib, dim=2)
-    sum_w = torch.where(sum_w >= 0.01, sum_w, torch.ones(4))
-    sum_tap = sum_tap / sum_w
-
-    return sum_tap
-    
-    sum_tap = torch.sum(tap_contrib, dim=2)
-
-    sum_w = torch.where(sum_w >= 0.01, sum_w, torch.ones(4))
-    sum_tap = sum_tap / sum_w
-    
-    sum_tap[(sum_w >= 0.01)] = sum_tap[(sum_w >= 0.01)] / sum_w[(sum_w >= 0.01)]
-    
-    return sum_tap
-    """
-
 def estimate_variance(curr, accum):
-    return NotImplemented
-    if accum['history_len'] < 4:
-        # spatial variance
-        pass
-    else:
-        # temporal variance
-        pass
+    vert_res, hori_res = accum['moment1'].shape[0:2]
+                           
+    sum_moment1 = torch.zeros_like(accum['moment1'])
+    sum_moment2 = torch.zeros_like(accum['moment1'])
+    sum_w = torch.zeros_like(accum['moment1'])
+    variance = torch.zeros_like(accum['moment1'])
+
+    y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
+    x = torch.linspace(0, hori_res - 1, steps=hori_res, dtype=torch.long)
+    y, x = torch.meshgrid(y, x)
+    y = y.unsqueeze(-1)
+    x = x.unsqueeze(-1)
+
+    # 벡터라이제이션
+    #  [1000, 900] 마스크 a. history length < 4
+    #  [1000, 900] 마스크 b. inside (윈도우 컴포넌트 좌표들의 out of border 체크)
+    #  조건. 마스크 a가 True인 픽셀에 대해서만 스페이셜 배리언스 필터링으로 fall-back
+    #    nested 조건. 마스크 b가 True인 윈도우 컴포넌트에 대해서만 웨이트 계산
+    #  joint : a & b인 픽셀에 대해서만 웨이트를 계산하고 배리언스를 갱신하도록 한다
+    #  ~a인 픽셀에 대해서는 그냥 누적된 모멘트를 이용해서 배리언스를 그대로 계산한다
+
+    enough_history = accum['history_len'] >= 4
+
+    for yy in range(-3, 4):
+        for xx in range(-3, 4):
+            v = y + yy
+            u = x + xx
+            inside = (u >= 0) & (u < hori_res) & (v >= 0) & (v < vert_res)
+            inside = inside.squeeze(-1)
+
+            masked_idx = masked_indices(~enough_history & inside)
+            center_x = masked_idx[:, 0]
+            center_y = masked_idx[:, 1]
+            p_x = center_x + xx
+            p_y = center_y + yy
+
+            depth_diff = (curr['world_pos'][center_y, center_x][:, 2] - curr['world_pos'][p_y, p_x][:, 2]).unsqueeze(-1)
+            w_depth = torch.exp(-linalg.norm(depth_diff, dim=-1) / sigma_depth**2)
+
+            cos_normals = torch.sum(curr['normal'][center_y, center_x] * curr['normal'][p_y, p_x], dim=-1)
+            w_normal = torch.exp(-cos_normals / sigma_normal**2)
+            
+            #luminance_diff = (accum['color'][center_y, center_x] - accum['color'][p_y, p_x])
+            #w_luminance = torch.exp(-linalg.norm(luminance_diff, dim=-1) / sigma_luminance**2)
+
+            weight = w_depth * w_normal
+            weight = weight.unsqueeze(-1)
+            
+            sum_moment1[~enough_history & inside] += accum['moment1'][~enough_history & inside] * weight
+            sum_moment2[~enough_history & inside] += accum['moment2'][~enough_history & inside] * weight
+            sum_w[~enough_history & inside] += weight
+    
+    sum_w = torch.clamp(sum_w, min=0.00001)
+    sum_moment1 /= sum_w
+    sum_moment2 /= sum_w
+
+    sum_moment1[enough_history] = accum['moment1'][enough_history]
+    sum_moment2[enough_history] = accum['moment2'][enough_history]
+    variance = sum_moment2 - sum_moment1 * sum_moment1
+
+    variance = torch.clamp(variance, min=0)
+    #variance = torch.abs(variance)
+
+    return variance 
 
 def masked_indices(mask):
     """
@@ -239,42 +243,64 @@ def masked_indices(mask):
     grid = torch.stack((x, y), dim=2)
 
     return grid[mask]
-    
-def atrous_filter(accum, step):
-    """
-    baseline implementation: [Dammertz2010] styile a-trous filtering (w/o variance esti.)
-    - 5-level wavelet transform
-    - atrous_filter 함수는 1개의 레벨만 처리함 (step > 0)
-    - 5x5 filtering
-    """
 
-    vert_res, hori_res = accum['color'].shape[0:2]
-    sigma_depth = 4
-    sigma_normal = 32
-    sigma_luminance = 8
+def gaussian_prefilter_variance(variance):
+
+    vert_res, hori_res = variance.shape[0:2]
+    kernel = torch.tensor([[1/16, 1/8, 1/16],
+                           [1/8,  1/4, 1/8],
+                           [1/16, 1/8, 1/16]], dtype=torch.float)
+
+    y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
+    x = torch.linspace(0, hori_res - 1, steps=hori_res, dtype=torch.long)
+    y, x = torch.meshgrid(y, x)
+    y = y.unsqueeze(-1)
+    x = x.unsqueeze(-1)
+    
+    filtered = torch.zeros_like(variance)
+
+    for yy in range(-1, 2):
+        for xx in range(-1, 2):
+            v = y + yy
+            u = x + xx
+            inside = (u >= 0) & (u < hori_res) & (v >= 0) & (v < vert_res)
+            inside = inside.squeeze(-1)
+
+            masked_idx = masked_indices(inside)
+            center_x = masked_idx[:, 0]
+            center_y = masked_idx[:, 1]
+            p_x = center_x + xx
+            p_y = center_y + yy
+
+            filtered[center_y, center_x] = variance[p_y, p_x] * kernel[yy+1, xx+1]
+
+    return filtered
+    
+def atrous_filter(curr, accum_color, variance, level):
+
+    vert_res, hori_res = curr['color'].shape[0:2]
+    step = 2**level
 
     # allow for smaller illumination variations to be smoothed
-    for i in range(0, step):
-        sigma_luminance *= 2.0**(-i)
+    # sigma_luminance = 2.0**(-level) * sigma_luminance
     
-    kernel = torch.tensor([[1/16, 1/16, 1/16, 1/16, 1/16],
-                           [1/16, 1/4,  1/4,  1/4,  1/16],
-                           [1/16, 1/4,  3/8,  1/4,  1/16],
-                           [1/16, 1/4,  1/4,  1/4,  1/16],
-                           [1/16, 1/16, 1/16, 1/16, 1/16]], dtype=torch.float)
+    kernel = torch.tensor([1/16, 1/4,  3/8,  1/4,  1/16], dtype=torch.float)
                            
-    filtered = torch.zeros_like(accum['color'])
-    sum_w = torch.zeros_like(accum['color'])
+    filtered = torch.zeros_like(curr['color'])
+    next_variance = torch.zeros_like(curr['color'])
+    sum_w = torch.zeros_like(curr['color'])
     y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
     x = torch.linspace(0, hori_res - 1, steps=hori_res, dtype=torch.long)
     y, x = torch.meshgrid(y, x)
     y = y.unsqueeze(-1)
     x = x.unsqueeze(-1)
 
+    prefiltered_variance = gaussian_prefilter_variance(variance)
+
     for yy in range(-2, 3):
         for xx in range(-2, 3):
             
-            kernel_w = kernel[yy+2, xx+2]
+            kernel_w = kernel[yy+2] * kernel[xx+2]
             # not center = (yy != 0) | (xx != 0)
             v = y + yy * step
             u = x + xx * step
@@ -284,28 +310,41 @@ def atrous_filter(accum, step):
             masked_idx = masked_indices(inside)
             center_x = masked_idx[:, 0]
             center_y = masked_idx[:, 1]
-            p_x = masked_idx[:, 0] + xx * step
-            p_y = masked_idx[:, 1] + yy * step
+            p_x = center_x + xx * step
+            p_y = center_y + yy * step
 
-            depth_diff = (accum['world_pos'][center_y, center_x][:, 2] - accum['world_pos'][p_y, p_x][:, 2]).unsqueeze(-1)
-            w_depth = torch.exp(-linalg.norm(depth_diff, dim=-1) / sigma_depth**2)
-            normal_diff = (accum['normal'][center_y, center_x] - accum['normal'][p_y, p_x])
-            w_normal = torch.exp(-linalg.norm(normal_diff, dim=-1) / sigma_normal**2)
-            luminance_diff = (accum['color'][center_y, center_x] - accum['color'][p_y, p_x])
-            w_luminance = torch.exp(-linalg.norm(luminance_diff, dim=-1) / sigma_luminance**2)
+            depth_diff = torch.abs(curr['world_pos'][center_y, center_x][:, 2] - curr['world_pos'][p_y, p_x][:, 2]).unsqueeze(-1)
+            w_depth = torch.exp(-depth_diff / sigma_depth)
 
-            weight = w_depth * w_normal * w_luminance
-            weight = weight.unsqueeze(-1)
+            cos_normals = torch.sum(curr['normal'][center_y, center_x] * curr['normal'][p_y, p_x], dim=-1)
+            w_normal = torch.clamp(cos_normals, min=0.0001) ** sigma_normal
+            #[Dammertz2010] style weight formulation
+            #w_normal = torch.exp(-cos_normals / sigma_normal**2)
+            w_normal = w_normal.unsqueeze(-1)
+            
+            luminance_diff = torch.abs(accum_color[center_y, center_x] - accum_color[p_y, p_x])
+            w_luminance = torch.exp(-luminance_diff / \
+                                    ((sigma_luminance * torch.sqrt(prefiltered_variance[center_y, center_x])) + 0.00001) \
+                                    )
+            
+            #[Dammertz2010] style weight formulation
+            #luminance_diff = (accum_color[center_y, center_x] - accum_color[p_y, p_x])
+            #w_luminance = torch.exp(-linalg.norm(luminance_diff, dim=-1) / sigma_luminance**2).unsqueeze(-1)
+            
+            weight = w_luminance # * w_depth * w_normal
             kernel_w = kernel_w.expand(weight.shape)
             w = weight * kernel_w
 
+            next_variance[center_y, center_x] += weight**2.0 * kernel_w**2.0 * variance[p_y, p_x]
+
             sum_w[center_y, center_x] += w
-            filtered[center_y, center_x] += accum['color'][p_y, p_x] * w
+            filtered[center_y, center_x] += accum_color[p_y, p_x] * w
     
     # normalize by weights
-    accum['color'] = filtered / sum_w
-
-    return accum
+    filtered /= sum_w
+    next_variance /= sum_w**2
+    
+    return filtered, next_variance
 
 
 frames = []
@@ -337,16 +376,20 @@ for i in range(1, len(frames)):
         accum['history_len'] = torch.zeros((vert_res, hori_res), dtype=torch.int)
     
     accum, consistency = temporal_accumulate(curr, accum, reproj_coord)
-    # variance = estimate_variance(curr, accum)
+    accum['variance'] = estimate_variance(curr, accum)
 
     accum['color'] = lerp_masked(curr['color'], accum['color'], 0.2, consistency)
     # the filtered color from the "first" wavelet itration as our color history
     # used to temporally integrate with future frames
-    accum = atrous_filter(accum, 1)
-    # thus we need to modify this part, as the paper's explanation
-    accum = atrous_filter(accum, 2)
-    accum = atrous_filter(accum, 4)
+    accum['color'], accum['variance'] = atrous_filter(curr, accum['color'], accum['variance'], 0)
+    filtered, accum['variance'] = atrous_filter(curr, accum['color'], accum['variance'], 1)
+    filtered, accum['variance'] = atrous_filter(curr, filtered, accum['variance'], 2)
+    filtered, accum['variance'] = atrous_filter(curr, filtered, accum['variance'], 3)
+    filtered, _ = atrous_filter(curr, filtered, accum['variance'], 4)
     
 curr['color'] = torch.permute(curr['color'], (2, 0, 1)).cpu().numpy()
 accum['color'] = torch.permute(accum['color'], (2, 0, 1)).cpu().numpy()
-print_srgb_comparison([curr['color'], accum['color']],['curr', 'accum'])
+filtered = torch.permute(filtered, (2, 0, 1)).cpu().numpy()
+accum['variance'] = torch.permute(accum['variance'], (2, 0, 1)).cpu().numpy()
+#print_srgb_comparison([curr['color'], filtered, accum['variance']],['curr', 'filtered', 'variance'])
+print_srgb_comparison([curr['color'], filtered],['curr', 'filtered'])
