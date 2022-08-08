@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import linalg
 
-sigma_depth = 4
+sigma_depth = 1
 sigma_normal = 128
 sigma_luminance = 4
 
@@ -104,12 +104,15 @@ def temporal_accumulate(curr, prev, reproj_coord):
 	|   +-+---+ |
 	+-----+-----+
 	"""
+
     vert_res, hori_res = reproj_coord.shape[0:2]
 
     x = reproj_coord[:, :, 0].unsqueeze(dim=2)
     y = reproj_coord[:, :, 1].unsqueeze(dim=2)
-    offsets = torch.tensor([[0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [1, 1, 0, 0]]) # z and w offsets are not used
-
+    
+    # z and w offsets are not used
+    offsets = torch.tensor([[0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [1, 1, 0, 0]]) 
+    
     # use the fractional portion of the coordinate
     x = torch.frac(x)
     y = torch.frac(y)
@@ -156,8 +159,7 @@ def temporal_accumulate(curr, prev, reproj_coord):
     accum = {}
     accum['color'] = color
     accum['moment1'] = moment1
-    accum['moment2'] = moment2
-    
+    accum['moment2'] = moment2    
     accum['history_len'] = prev['history_len']
     accum['world_pos'] = prev['world_pos']
     accum['normal'] = prev['normal']
@@ -165,6 +167,7 @@ def temporal_accumulate(curr, prev, reproj_coord):
     return accum, any_valid
 
 def estimate_variance(curr, accum):
+
     vert_res, hori_res = accum['moment1'].shape[0:2]
                            
     sum_moment1 = torch.zeros_like(accum['moment1'])
@@ -226,7 +229,6 @@ def estimate_variance(curr, accum):
     variance = sum_moment2 - sum_moment1 * sum_moment1
 
     variance = torch.clamp(variance, min=0)
-    #variance = torch.abs(variance)
 
     return variance 
 
@@ -235,6 +237,7 @@ def masked_indices(mask):
     :return: the indicies tensor of True elements for given mask tensor
              its tensor shape is same as the mask 
     """
+
     # make the indices tensor (each element represents its coordinate)
     vert_res, hori_res = mask.shape[0:2]
     y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
@@ -278,17 +281,15 @@ def gaussian_prefilter_variance(variance):
     
 def atrous_filter(curr, accum_color, variance, level):
 
-    vert_res, hori_res = curr['color'].shape[0:2]
-    step = 2**level
-
-    # allow for smaller illumination variations to be smoothed
-    # sigma_luminance = 2.0**(-level) * sigma_luminance
-    
+    vert_res, hori_res = accum_color.shape[0:2]
+    step = 2 ** level
     kernel = torch.tensor([1/16, 1/4,  3/8,  1/4,  1/16], dtype=torch.float)
-                           
-    filtered = torch.zeros_like(curr['color'])
-    next_variance = torch.zeros_like(curr['color'])
-    sum_w = torch.zeros_like(curr['color'])
+    
+    # initialize the tensors with center pixel contribution
+    filtered = accum_color.clone() * kernel[2]*kernel[2]
+    next_variance = variance.clone() * kernel[2]*kernel[2]
+    sum_w = torch.full(accum_color.shape, kernel[2]*kernel[2], dtype=torch.float)
+    
     y = torch.linspace(0, vert_res - 1, steps=vert_res, dtype=torch.long)
     x = torch.linspace(0, hori_res - 1, steps=hori_res, dtype=torch.long)
     y, x = torch.meshgrid(y, x, indexing='ij')
@@ -299,9 +300,13 @@ def atrous_filter(curr, accum_color, variance, level):
 
     for yy in range(-2, 3):
         for xx in range(-2, 3):
-            
+
+            # center pixel contribution is pre-accumulated out of for-loop.
+            if yy == 0 and xx == 0:
+                continue
+
             kernel_w = kernel[yy+2] * kernel[xx+2]
-            # not center = (yy != 0) | (xx != 0)
+
             v = y + yy * step
             u = x + xx * step
             inside = (u >= 0) & (u < hori_res) & (v >= 0) & (v < vert_res)
@@ -313,13 +318,17 @@ def atrous_filter(curr, accum_color, variance, level):
             p_x = center_x + xx * step
             p_y = center_y + yy * step
 
-            depth_diff = torch.abs(curr['world_pos'][center_y, center_x][:, 2] - curr['world_pos'][p_y, p_x][:, 2]).unsqueeze(-1)
-            w_depth = torch.exp(-depth_diff / sigma_depth)
+            depth_diff = torch.abs(curr['world_pos'][center_y, center_x][:, 2] - curr['world_pos'][p_y, p_x][:, 2])
+            depth_diff = depth_diff.unsqueeze(-1)
+            w_depth = torch.exp(-depth_diff / (sigma_depth + 0.00001))
 
+            # the edge-stopping function on world-space normals would degrade the weight to zero
+            # and thus results in black pixels for non-smooth region.
+            # to deal with this problem, we pre-accumulate the color and weight for center pixel of each window
+            # (see the tensor definition part of this function)
             cos_normals = torch.sum(curr['normal'][center_y, center_x] * curr['normal'][p_y, p_x], dim=-1)
             w_normal = torch.clamp(cos_normals, min=0) ** sigma_normal
-            #[Dammertz2010] style weight formulation
-            #w_normal = torch.exp(-cos_normals / sigma_normal**2)
+            #w_normal = torch.exp(-cos_normals / sigma_normal**2) # [Dammertz2010] style weight formulation
             w_normal = w_normal.unsqueeze(-1)
             
             luminance_diff = torch.abs(accum_color[center_y, center_x] - accum_color[p_y, p_x])
@@ -327,19 +336,14 @@ def atrous_filter(curr, accum_color, variance, level):
                                     ((sigma_luminance * torch.sqrt(prefiltered_variance[center_y, center_x])) + 0.00001) \
                                     )
             
-            #[Dammertz2010] style weight formulation
-            #luminance_diff = (accum_color[center_y, center_x] - accum_color[p_y, p_x])
-            #w_luminance = torch.exp(-linalg.norm(luminance_diff, dim=-1) / sigma_luminance**2).unsqueeze(-1)
-            
-            weight = w_luminance * w_normal #* w_depth# * w_normal
+            weight = w_luminance * w_normal * w_depth
             kernel_w = kernel_w.expand(weight.shape)
             w = weight * kernel_w
 
-            next_variance[center_y, center_x] += weight**2.0 * kernel_w**2.0 * variance[p_y, p_x]
-
             sum_w[center_y, center_x] += w
             filtered[center_y, center_x] += accum_color[p_y, p_x] * w
-    
+            next_variance[center_y, center_x] += variance[p_y, p_x] * (w ** 2.0)
+
     # normalize by weights
     filtered /= sum_w
     next_variance /= sum_w**2
@@ -349,7 +353,7 @@ def atrous_filter(curr, accum_color, variance, level):
 
 frames = []
 camera_infos = []
-frame_step = 20
+frame_step = 1
 for i in tqdm(range(0, 151, frame_step)):
     frame, camera_info = load_frame(i)
     frames.append(frame)
@@ -379,8 +383,8 @@ for i in tqdm(range(1, len(frames))):
     
     accum, consistency = temporal_accumulate(curr, accum, reproj_coord)
     accum['variance'] = estimate_variance(curr, accum)
+    accum['color'] = lerp_masked(curr['color'], accum['color'], 0.05, consistency)
 
-    accum['color'] = lerp_masked(curr['color'], accum['color'], 0.2, consistency)
     # the filtered color from the "first" wavelet itration as our color history
     # used to temporally integrate with future frames
     accum['color'], accum['variance'] = atrous_filter(curr, accum['color'], accum['variance'], 0)

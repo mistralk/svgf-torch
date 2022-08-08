@@ -61,6 +61,8 @@ def load_frame(frame_i):
     frame['color'] = exr_to_numpy('dataset/RunningEstimateXyza_1spp_R_{}.exr'.format(frame_i), 'RGBA')
     frame['world_pos'] = exr_to_numpy('dataset/Feature_WorldPosition_1spp_R_{}.exr'.format(frame_i), 'RGB')
     frame['normal'] = exr_to_numpy('dataset/Feature_NormalOrientation_1spp_R_{}.exr'.format(frame_i), 'RGB')
+    #frame['normal'] = exr_to_numpy('dataset/Feature_RunningNormalOrientation_1024spp_R_{}.exr'.format(frame_i), 'RGB')
+    #frame['world_pos'] = exr_to_numpy('dataset/Feature_RunningWorldPosition_1024spp_R_{}.exr'.format(frame_i), 'RGB')
 
     frame['color'] = frame['color'].transpose((1, 2, 0))
     frame['world_pos'] = frame['world_pos'].transpose((1, 2, 0))
