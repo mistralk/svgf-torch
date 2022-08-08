@@ -128,13 +128,10 @@ def temporal_accumulate(curr, prev, reproj_coord):
         any_valid = torch.logical_or(any_valid, valid[tap])
         bilinear_w[:, :, tap] = bilinear_w[:, :, tap] * valid[tap] # now invalid taps have 0 weight
     
-    prev['history_len'][any_valid] += 1
-    prev['history_len'][~any_valid] = 0
-    
     sum_w = torch.sum(bilinear_w, dim=2) # sum of valid tap weights for each pixel
     
     # expand for RGBA color channels
-    sum_w = sum_w.unsqueeze(dim=2).expand(*sum_w.shape[0:2], 4) 
+    sum_w = sum_w.unsqueeze(dim=2).expand(*sum_w.shape[0:2], 4).clone()
  
     sum_contrib = torch.zeros_like(sum_w)
         
@@ -145,10 +142,24 @@ def temporal_accumulate(curr, prev, reproj_coord):
         coord_y = coord[:, 1]
         sum_contrib[valid[tap]] += prev['color'][coord_y, coord_x] * bilinear_w[valid[tap]][:, tap].unsqueeze(-1)
 
+    # additional 3x3 cross-bilateral filtering for inconsistent pixels:
+    # 3x3 윈도우의 각 탭에 대해, 이전 프레임으로의 리프로젝션 컨시스턴시 테스트 수행
+    # 바이너리 웨이트 : 컨시스턴트한 탭에는 웨이트 1, 인컨시스턴트한 탭에는 웨이트 0을 부여
+    any_valid_for_3x3 = torch.zeros_like(any_valid)
+    for yy in range(-1, 2):
+        for xx in range(-1, 2):
+            offset = torch.tensor([xx, yy, 0, 0])
+            valid_mask = test_consistency(curr, prev, reproj_coord + offset)
+            sum_w[~any_valid & valid_mask] += 1
+            sum_contrib[~any_valid & valid_mask] += prev['color'][~any_valid & valid_mask]
+            any_valid_for_3x3 = torch.logical_or(any_valid_for_3x3, valid_mask)
+
+    any_valid = torch.logical_or(any_valid, any_valid_for_3x3)
+    prev['history_len'][any_valid] += 1
+    prev['history_len'][~any_valid] = 0
+
     color = sum_contrib / sum_w
     color = color.nan_to_num()
-
-    # TODO: additional 3x3 filtering for inconsistent pixels
 
     # per-pixel moment calculation and temporal integration
     moment1 = color
