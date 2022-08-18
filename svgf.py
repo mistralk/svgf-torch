@@ -2,7 +2,6 @@ from utils import *
 from tqdm import tqdm
 import numpy as np
 import torch
-from torch import linalg
 
 sigma_depth = 1
 sigma_normal = 128
@@ -66,10 +65,10 @@ def test_consistency(curr, prev, reproj_coord):
     reproj_y = reproj_coord[:, :, 1]
     
     # compare curr depth and reprojected depth
-    similar_depth = torch.abs(curr['world_pos'][:, :, 2] - prev['world_pos'][reproj_y, reproj_x, 2]) < 5.0
+    similar_depth = torch.abs(curr['world_pos'][:, :, 2] - prev['world_pos'][reproj_y, reproj_x, 2]) < 0.03
 
     # compare curr normal and reprojected normal 
-    similar_normal = torch.linalg.vector_norm(curr['normal'][:, :] - prev['normal'][reproj_y, reproj_x], dim=2) < 5.0
+    similar_normal = torch.linalg.vector_norm(curr['normal'][:, :] - prev['normal'][reproj_y, reproj_x], dim=2) < 1
 
     mask = torch.logical_and(inside, similar_depth)
     mask = torch.logical_and(mask, similar_normal)
@@ -192,7 +191,6 @@ def estimate_variance(curr, accum):
     y = y.unsqueeze(-1)
     x = x.unsqueeze(-1)
 
-    # 벡터라이제이션
     #  [1000, 900] 마스크 a. history length < 4
     #  [1000, 900] 마스크 b. inside (윈도우 컴포넌트 좌표들의 out of border 체크)
     #  조건. 마스크 a가 True인 픽셀에 대해서만 스페이셜 배리언스 필터링으로 fall-back
@@ -215,11 +213,14 @@ def estimate_variance(curr, accum):
             p_x = center_x + xx
             p_y = center_y + yy
 
-            depth_diff = (curr['world_pos'][center_y, center_x][:, 2] - curr['world_pos'][p_y, p_x][:, 2]).unsqueeze(-1)
-            w_depth = torch.exp(-linalg.norm(depth_diff, dim=-1) / sigma_depth**2)
+            #depth_diff = (curr['world_pos'][center_y, center_x][:, 2] - curr['world_pos'][p_y, p_x][:, 2]).unsqueeze(-1)
+            #w_depth = torch.exp(-linalg.norm(depth_diff, dim=-1) / sigma_depth**2)
+            depth_diff = torch.abs(curr['world_pos'][center_y, center_x][:, 2] - curr['world_pos'][p_y, p_x][:, 2])
+            w_depth = torch.exp(-depth_diff / (sigma_depth + 0.00001))
 
             cos_normals = torch.sum(curr['normal'][center_y, center_x] * curr['normal'][p_y, p_x], dim=-1)
-            w_normal = torch.exp(-cos_normals / sigma_normal**2)
+            #w_normal = torch.exp(-cos_normals / sigma_normal**2)
+            w_normal = torch.clamp(cos_normals, min=0) ** sigma_normal
             
             #luminance_diff = (accum['color'][center_y, center_x] - accum['color'][p_y, p_x])
             #w_luminance = torch.exp(-linalg.norm(luminance_diff, dim=-1) / sigma_luminance**2)
@@ -331,7 +332,8 @@ def atrous_filter(curr, accum_color, variance, level):
 
             depth_diff = torch.abs(curr['world_pos'][center_y, center_x][:, 2] - curr['world_pos'][p_y, p_x][:, 2])
             depth_diff = depth_diff.unsqueeze(-1)
-            w_depth = torch.exp(-depth_diff / (sigma_depth + 0.00001))
+            w_depth = torch.exp(-depth_diff / (sigma_depth))
+            #w_depth = torch.exp(-depth_diff)**sigma_depth
 
             # the edge-stopping function on world-space normals would degrade the weight to zero
             # and thus results in black pixels for non-smooth region.
@@ -339,7 +341,7 @@ def atrous_filter(curr, accum_color, variance, level):
             # (see the tensor definition part of this function)
             cos_normals = torch.sum(curr['normal'][center_y, center_x] * curr['normal'][p_y, p_x], dim=-1)
             w_normal = torch.clamp(cos_normals, min=0) ** sigma_normal
-            #w_normal = torch.exp(-cos_normals / sigma_normal**2) # [Dammertz2010] style weight formulation
+            #w_normal = torch.exp(-cos_normals / sigma_normal**2) # [Dammertz et al. 2010] style weight formulation
             w_normal = w_normal.unsqueeze(-1)
             
             luminance_diff = torch.abs(accum_color[center_y, center_x] - accum_color[p_y, p_x])
@@ -370,7 +372,7 @@ for i in tqdm(range(0, 151, frame_step)):
     frames.append(frame)
     camera_infos.append(camera_info)
 
-print('{} frames loaded.'.format(len(range(0, 151, frame_step))))
+print(f'{len(range(0, 151, frame_step))} frames loaded.')
 
 vert_res, hori_res = frames[0]['color'].shape[0:2]
 
@@ -394,7 +396,7 @@ for i in tqdm(range(1, len(frames))):
     
     accum, consistency = temporal_accumulate(curr, accum, reproj_coord)
     accum['variance'] = estimate_variance(curr, accum)
-    accum['color'] = lerp_masked(curr['color'], accum['color'], 0.05, consistency)
+    accum['color'] = lerp_masked(curr['color'], accum['color'], 0.2, consistency)
 
     # the filtered color from the "first" wavelet itration as our color history
     # used to temporally integrate with future frames
@@ -408,5 +410,5 @@ curr['color'] = torch.permute(curr['color'], (2, 0, 1)).cpu().numpy()
 accum['color'] = torch.permute(accum['color'], (2, 0, 1)).cpu().numpy()
 filtered = torch.permute(filtered, (2, 0, 1)).cpu().numpy()
 accum['variance'] = torch.permute(accum['variance'], (2, 0, 1)).cpu().numpy()
-#print_srgb_comparison([curr['color'], filtered, accum['variance']],['curr', 'filtered', 'variance'])
+
 print_srgb_comparison([curr['color'], filtered],['curr', 'filtered'])
